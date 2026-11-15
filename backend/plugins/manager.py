@@ -29,6 +29,9 @@ class PluginManager:
     def running(self) -> list[str]:
         return list(self._pool.keys())
 
+    def statuses(self) -> dict:
+        return {name: inst.status for name, inst in self._pool.items() if inst.status is not None}
+
     def clear_overlays(self) -> None:
         """
         Clears any currently displayed overlays (frontend will render none).

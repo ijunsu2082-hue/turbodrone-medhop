@@ -18,6 +18,7 @@ export interface CommandCapabilities {
   camera_tilt: boolean;
   camera_switch: boolean;
   speed_control: boolean;
+  calibrate: boolean;
 }
 
 export type SpeedTier = 0 | 1 | 2;
@@ -38,11 +39,47 @@ export function useControls() {
   /* ------- Plugin state (event-driven) ------- */
   const pluginRunningRef = useRef<boolean>(false);
   const stoppedPluginOnceRef = useRef<boolean>(false);    // rate-limit stop calls per burst
+  const [linkEpoch, setLinkEpoch] = useState<number>(0);
 
-  // Open WS once on mount, close on unmount
+  // Keep the control WS open: reconnect if it drops, close on unmount.
+  // Without this, every command is silently lost after a single disconnect.
   useEffect(() => {
-    ws.current = new WebSocket("ws://localhost:8000/ws");
+    let disposed = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+
+    // The backend can have a plugin running that this page doesn't know about
+    // (after a reload or reconnect). Plugin auto-stop on user input relies on it.
+    const syncPluginState = async () => {
+      try {
+        const res = await fetch(`${API_BASE_URL}/plugins`);
+        if (disposed || !res.ok) return;
+        const data = await res.json();
+        const running = (data?.running ?? []).length > 0;
+        window.dispatchEvent(new CustomEvent(running ? "plugin:running" : "plugin:stopped"));
+      } catch {
+        // Backend unreachable: the next reconnect syncs again.
+      }
+    };
+
+    const connect = () => {
+      const socket = new WebSocket("ws://localhost:8000/ws");
+      ws.current = socket;
+      socket.onopen = () => {
+        void syncPluginState();
+        setLinkEpoch((n) => n + 1);  // re-read capabilities after a backend restart
+      };
+      socket.onclose = () => {
+        if (disposed) return;
+        console.warn("[Controls] WebSocket disconnected. Reconnecting...");
+        retryTimer = setTimeout(connect, 1000);
+      };
+    };
+
+    connect();
+
     return () => {
+      disposed = true;
+      clearTimeout(retryTimer);
       ws.current?.close();
       ws.current = null;
     };
@@ -72,6 +109,7 @@ export function useControls() {
     camera_tilt: false,
     camera_switch: false,
     speed_control: false,
+    calibrate: false,
   });
   const [speedTier, setSpeedTierSt] = useState<SpeedTier>(2);
   const [cameraTiltDirection, setCameraTiltDirectionSt] = useState<CameraTiltDirection>(0);
@@ -103,6 +141,7 @@ export function useControls() {
           camera_tilt: Boolean(data?.commands?.camera_tilt),
           camera_switch: Boolean(data?.commands?.camera_switch),
           speed_control: Boolean(data?.commands?.speed_control),
+          calibrate: Boolean(data?.commands?.calibrate),
         });
       } catch {
         // Keep optimistic defaults when the backend is temporarily unavailable.
@@ -113,7 +152,7 @@ export function useControls() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [linkEpoch]);
 
   /* --------------- gamepad detection --------------- */
   useEffect(() => {
@@ -169,18 +208,19 @@ export function useControls() {
       ArrowRight: { axis: "yaw",      dir: +1 },
     };
 
+    // Caps Lock or Shift must not turn "w" into an unmapped "W".
+    const keyFor = (e: KeyboardEvent) => (e.key.length === 1 ? e.key.toLowerCase() : e.key);
+
     const down = (e: KeyboardEvent) => {
-      const m = map[e.key];
+      const m = map[keyFor(e)];
       if (!m) return;
+      e.preventDefault();  // arrow keys must not scroll the page
       axesRef.current[m.axis] = m.dir;
       setAxes({ ...axesRef.current });
-
-      // If any plugin is running and user provides input → stop plugin once
-      maybeStopPluginOnUserInput();
     };
 
     const up = (e: KeyboardEvent) => {
-      const m = map[e.key];
+      const m = map[keyFor(e)];
       if (!m) return;
       if (axesRef.current[m.axis] === m.dir) {
         axesRef.current[m.axis] = 0;
@@ -188,11 +228,22 @@ export function useControls() {
       }
     };
 
+    // Switching windows hides the keyup, which would leave the drone moving.
+    const releaseAll = () => {
+      axesRef.current.throttle = 0;
+      axesRef.current.yaw = 0;
+      axesRef.current.pitch = 0;
+      axesRef.current.roll = 0;
+      setAxes({ ...axesRef.current });
+    };
+
     window.addEventListener("keydown", down);
     window.addEventListener("keyup",   up);
+    window.addEventListener("blur",    releaseAll);
     return () => {
       window.removeEventListener("keydown", down);
       window.removeEventListener("keyup",   up);
+      window.removeEventListener("blur",    releaseAll);
     };
   }, [mode]);      // re-run effect when mode flips
 
@@ -215,7 +266,6 @@ export function useControls() {
       e.preventDefault();
       cameraTiltDirectionRef.current = direction;
       setCameraTiltDirectionSt(direction);
-      maybeStopPluginOnUserInput();
     };
 
     const up = (e: KeyboardEvent) => {
@@ -260,12 +310,6 @@ export function useControls() {
         axesRef.current.yaw      = applyDeadzone(gp.axes[2]);     // right X
         axesRef.current.throttle = applyDeadzone(-gp.axes[3]);    // right Y (up == +1)
         setAxes({ ...axesRef.current });
-
-        // Stop plugin when the first non-zero user sticks are detected
-        if (Math.abs(axesRef.current.roll) > 0 || Math.abs(axesRef.current.pitch) > 0 ||
-            Math.abs(axesRef.current.yaw)  > 0 || Math.abs(axesRef.current.throttle) > 0) {
-          maybeStopPluginOnUserInput();
-        }
       }
       raf = requestAnimationFrame(poll);
     };
@@ -287,11 +331,6 @@ export function useControls() {
       axesRef.current.roll  = Math.max(-1, Math.min(1, axesRef.current.roll  +  e.movementX * sensitivity));
       axesRef.current.pitch = Math.max(-1, Math.min(1, axesRef.current.pitch - e.movementY * sensitivity));
       setAxes({ ...axesRef.current });
-      
-      // Stop plugin when user moves mouse/trackpoint
-      if (Math.abs(e.movementX) > 0 || Math.abs(e.movementY) > 0) {
-        maybeStopPluginOnUserInput();
-      }
     };
 
     /* gentle recentre so sticks don't stay deflected forever */
@@ -330,10 +369,8 @@ export function useControls() {
     const interval = setInterval(() => {
       if (ws.current?.readyState !== WebSocket.OPEN) return;
 
-      // COMPLETELY suppress all transmissions when any plugin is running
-      // This prevents frontend from overwriting plugin commands
-      if (pluginRunningRef.current) return;
-
+      // Also sent while a plugin runs: the backend gives the user priority over
+      // the plugin only while these sticks are moved, and tilt works regardless.
       ws.current.send(JSON.stringify({
         type: "axes",
         mode: modeRef.current,
@@ -353,7 +390,8 @@ export function useControls() {
     }
   };
 
-  const maybeStopPluginOnUserInput = async () => {
+  // Land and e-stop end a plugin's flight. Flight keys only pause it.
+  const stopRunningPlugins = async () => {
     if (!pluginRunningRef.current || stoppedPluginOnceRef.current) return;
     try {
       // Stop all running plugins for simplicity
@@ -373,9 +411,15 @@ export function useControls() {
     }
   };
 
+  // Send first so the command isn't delayed by stopping a running plugin.
+  const flightCommand = (type: string) => {
+    sendCommand(type);
+    stopRunningPlugins();
+  };
   const takeOff = () => sendCommand("takeoff");
-  const land    = () => sendCommand("land");
-  const emergencyStop = () => sendCommand("estop");
+  const land    = () => flightCommand("land");
+  const emergencyStop = () => flightCommand("estop");
+  const calibrate = () => sendCommand("calibrate");
   const setSpeedIndex = useCallback((speedIndex: number) => {
     sendCommand("set_speed_index", { speed_index: speedIndex });
   }, []);
@@ -387,9 +431,6 @@ export function useControls() {
     if (!commandCapabilities.camera_tilt) return;
     cameraTiltDirectionRef.current = direction;
     setCameraTiltDirectionSt(direction);
-    if (direction !== 0) {
-      maybeStopPluginOnUserInput();
-    }
   };
 
   /* ------------- hook return ------------------------------- */
@@ -403,6 +444,7 @@ export function useControls() {
     takeOff,
     land,
     emergencyStop,
+    calibrate,
     setSpeedIndex,
     speedTier,
     setSpeedTier,

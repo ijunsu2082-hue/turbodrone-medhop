@@ -139,3 +139,7 @@ After that, you can work on an implementation that is compatible with the existi
 
 ## Experimental Support
 For drones and apps with limited support which are not yet fully integrated into Turbodrone, see the `experimental` directory.
+
+## MedHop integration branch
+
+The `medhop-integration` branch in [ijunsu2082-hue/turbodrone-medhop](https://github.com/ijunsu2082-hue/turbodrone-medhop/tree/medhop-integration) contains local compatibility changes used by the MedHop project. See [`MEDHOP_COMPATIBILITY.md`](MEDHOP_COMPATIBILITY.md) for setup notes and limitations. The default `master` branch remains aligned with this upstream repository.

@@ -1,8 +1,9 @@
 # Start Video Feed
 START_STREAM = b"\xef\x00\x04\x00"
 
-# Unknown
-UNK_FRAME = b"\xef\x20\x06\x00\x01\x65"
+# Custom command `01 65`. The drone answers with an MCU message starting `01 65`
+# that carries its firmware version string.
+VERSION_QUERY = b"\xef\x20\x06\x00\x01\x65"
 
 # Drone Info I think
 SSID2 = (

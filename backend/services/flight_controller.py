@@ -7,13 +7,19 @@ logger = logging.getLogger(__name__)
 
 class FlightController:
     """Core service that manages drone flight operations"""
-    
+
+    # Input from the user beats a plugin until this long after their last input.
+    MANUAL_HOLD_S = 1.0
+    # Sources that still apply while the user is flying by hand.
+    MANUAL_PRIORITY_SOURCES = frozenset({"frontend", "follow-stop"})
+
     def __init__(self, drone_model, protocol_adapter, update_rate=80.0):
         self.model = drone_model
         self.protocol = protocol_adapter
         self.update_interval = 1.0 / update_rate
         self.running = True
-        
+        self._manual_until = 0.0
+
         # Input state
         self.throttle_dir = 0
         self.yaw_dir = 0
@@ -60,8 +66,18 @@ class FlightController:
         """
         self.set_axes_from("unknown", throttle, yaw, pitch, roll)
 
+    def note_manual_input(self, hold_s: float = MANUAL_HOLD_S) -> None:
+        """The user is flying by hand: hold off plugin commands for a moment."""
+        self._manual_until = time.monotonic() + hold_s
+
+    def manual_override_active(self) -> bool:
+        return time.monotonic() < self._manual_until
+
     def set_axes_from(self, source: str, throttle: float, yaw: float, pitch: float, roll: float) -> None:
         """Same as set_axes, but records the control source and logs."""
+        if source not in self.MANUAL_PRIORITY_SOURCES and self.manual_override_active():
+            return
+
         self.throttle_dir = max(-1.0, min(1.0, throttle))
         self.yaw_dir      = max(-1.0, min(1.0, yaw))
         self.pitch_dir    = max(-1.0, min(1.0, pitch))

@@ -9,9 +9,12 @@ from models.video_frame import VideoFrame
 from protocols.base_video_protocol import BaseVideoProtocolAdapter
 from utils.wifi_uav_ack_state import WifiUavAckState
 from utils.wifi_uav_packets import (
+    NEUTRAL_EXTENDED_COMMAND,
     START_STREAM,
+    VERSION_QUERY,
     build_native_ack_packet,
 )
+from utils.wifi_uav_mcu import describe_mcu_message, parse_mcu_packet
 from utils.wifi_uav_jpeg import generate_jpeg_headers, EOI
 from utils.wifi_uav_variants import get_wifi_uav_capabilities
 
@@ -72,6 +75,14 @@ class WifiUavVideoProtocolAdapter(BaseVideoProtocolAdapter):
         self._target_ports = self._resolve_target_ports(control_port)
 
         self._sock = self._create_duplex_socket()
+        self._rc_adapter = None
+
+        # What the drone reports about itself (battery, flight state, firmware)
+        self._version_known = False
+        self._version_queries_left = 3
+        self._next_version_query = 0.0
+        self._last_mcu_log: dict[bytes, tuple[bytes, float]] = {}
+        self._unknown_packet_types: set[bytes] = set()
 
         # Pre-built JPEG header (SOI + quant tables + SOF0 + …)
         self._jpeg_header = generate_jpeg_headers(jpeg_width, jpeg_height, components)
@@ -140,10 +151,20 @@ class WifiUavVideoProtocolAdapter(BaseVideoProtocolAdapter):
         bytes 36..39  : fragment count
         bytes 56+     : JPEG payload
         """
-        parsed = self._parse_fragment_header(payload)
-        if parsed is None:
+        mcu_message = parse_mcu_packet(payload)
+        if mcu_message is not None:
+            self._on_mcu_message(mcu_message)
             return None
 
+        parsed = self._parse_fragment_header(payload)
+        if parsed is None:
+            packet_type = payload[:2]
+            if packet_type not in self._unknown_packet_types:
+                self._unknown_packet_types.add(packet_type)
+                logger.info("[wifi-uav] Unrecognized packet from drone: %s", payload[:32].hex(" "))
+            return None
+
+        self._maybe_query_version()
         frame_id, frag_id, fragment_total, frame_body_len, quality, jpeg_payload = parsed
         self._stream_started = True
         self._last_rx_ts = time.time()
@@ -221,11 +242,38 @@ class WifiUavVideoProtocolAdapter(BaseVideoProtocolAdapter):
             except Exception:
                 pass
             self._warmup_stop.wait(0.2)
+    def _on_mcu_message(self, message: bytes) -> None:
+        """Log what the drone reports, once per change and at most twice a second."""
+        kind = message[:2]
+        if kind == b"\x01\x65":
+            self._version_known = True
+        now = time.time()
+        last_message, last_ts = self._last_mcu_log.get(kind, (None, 0.0))
+        if message == last_message or now - last_ts < 0.5:
+            return
+        self._last_mcu_log[kind] = (message, now)
+        logger.info("[wifi-uav] Drone says: %s", describe_mcu_message(message))
+
+    def _maybe_query_version(self) -> None:
+        """Ask for the firmware version a few times once the drone is talking."""
+        if self._version_known or self._version_queries_left <= 0:
+            return
+        now = time.time()
+        if now < self._next_version_query:
+            return
+        self._version_queries_left -= 1
+        self._next_version_query = now + 1.0
+        for port in self._target_ports:
+            self._safe_sendto(VERSION_QUERY, port, "VERSION_QUERY")
+
     def _send_frame_request(self, frame_id: int) -> None:
         command_seq = frame_id & 0xFFFFFFFF
+        # The native app embeds its latest user command in every request. A
+        # neutral command here would cancel takeoff, land, e-stop and stick input.
+        command = getattr(self._rc_adapter, "latest_command", None) or NEUTRAL_EXTENDED_COMMAND
 
-        rqst_a = build_native_ack_packet(command_seq, [])
-        rqst_b = build_native_ack_packet(command_seq, self._build_ack_slots(frame_id))
+        rqst_a = build_native_ack_packet(command_seq, [], command)
+        rqst_b = build_native_ack_packet(command_seq, self._build_ack_slots(frame_id), command)
 
         for port in self._target_ports:
             self._safe_sendto(rqst_a, port, f"REQ_A frame={frame_id}")
@@ -294,6 +342,7 @@ class WifiUavVideoProtocolAdapter(BaseVideoProtocolAdapter):
 
     def set_rc_adapter(self, rc_adapter) -> None:
         """Provide the RC adapter with our shared UDP socket."""
+        self._rc_adapter = rc_adapter
         try:
             rc_adapter.set_socket(self._sock)
             self._dbg("[wifi-uav] RC adapter socket shared")

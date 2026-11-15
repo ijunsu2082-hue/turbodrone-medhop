@@ -1,4 +1,5 @@
 import asyncio
+import atexit
 import threading
 import queue
 import time
@@ -7,7 +8,7 @@ from typing import Any, Optional
 import logging
 import os
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketState
 from utils.logging_config import bootstrap_runtime, configure_logging
@@ -15,6 +16,7 @@ from utils.logging_config import bootstrap_runtime, configure_logging
 bootstrap_runtime()
 
 from services.flight_controller import FlightController
+from services.video_recorder import PageRecording, RecordingError, VideoRecorder
 from control.strategies import DirectStrategy, IncrementalStrategy
 from services.video_receiver import VideoReceiverService
 from models.s2x_rc import S2xDroneModel as S2xRcModel
@@ -120,6 +122,7 @@ def _control_capabilities_for_drone(drone_type: str) -> dict[str, bool]:
             "camera_tilt": wifi_uav_capabilities.supports_camera_tilt,
             "camera_switch": wifi_uav_capabilities.supports_camera_switch,
             "speed_control": True,
+            "calibrate": True,
         }
 
     if drone_type in {"s2x", "wifi_cam"} or drone_type in COOINGDV_DRONE_TYPES:
@@ -472,7 +475,8 @@ async def lifespan(app: FastAPI):
     plugin_frame_q: Optional[queue.Queue] = None
     overlay_broadcaster: Optional["OverlayBroadcaster"] = None
     if PLUGINS_ENABLED:
-        PLUGIN_FRAME_Q = DroppingQueue(maxsize=100)
+        # Newest frame only: a backlog would make plugins steer from old video.
+        PLUGIN_FRAME_Q = DroppingQueue(maxsize=1)
         PLUGIN_OVERLAY_Q = DroppingQueue(maxsize=100)
         plugin_manager = PluginManager(flight_controller, PLUGIN_FRAME_Q, PLUGIN_OVERLAY_Q)
         plugin_frame_q = PLUGIN_FRAME_Q
@@ -499,6 +503,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
+    RECORDER.stop_if_active()
     if overlay_broadcaster:
         overlay_broadcaster.stop()
     if plugin_manager:
@@ -529,6 +534,18 @@ app.add_middleware(
 # ───────────────────────────────────────────────────────────────
 RAW_Q: queue.Queue = DroppingQueue(maxsize=2)          # thread-safe → pump
 
+# When the pump last saw a video frame, for the page's "drone connected" status.
+LAST_FRAME_TIME = {"value": float("-inf")}
+VIDEO_LIVE_WINDOW_S = 1.5
+
+# How long a plugin waits after takeoff before it starts steering.
+TAKEOFF_CLEAR_S = 2.0
+
+RECORDER = VideoRecorder()
+atexit.register(RECORDER.stop_if_active)
+PAGE_RECORDING = PageRecording()
+atexit.register(PAGE_RECORDING.stop)
+
 flight_controller: Optional[FlightController] = None
 receiver: Optional[VideoReceiverService] = None
 plugin_manager: Optional[PluginManager] = None
@@ -540,6 +557,65 @@ video_keepalive = None  # legacy; no longer used
 # ───────────────────────────────────────────────────────────────
 # Plugin Management
 # ───────────────────────────────────────────────────────────────
+def _friendly_path(path: str) -> str:
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home) else path
+
+
+@app.post("/recording/start")
+async def start_recording():
+    try:
+        await asyncio.to_thread(RECORDER.start)
+    except RecordingError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"status": "recording"}
+
+
+@app.post("/recording/stop")
+async def stop_recording():
+    page_path = await asyncio.to_thread(PAGE_RECORDING.stop)
+    try:
+        path = await asyncio.to_thread(RECORDER.stop)
+    except RecordingError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {
+        "path": _friendly_path(path) if path else None,
+        "page_path": _friendly_path(page_path) if page_path else None,
+    }
+
+
+@app.post("/recording/page/start")
+async def start_page_recording(extension: str):
+    try:
+        await asyncio.to_thread(PAGE_RECORDING.start, extension)
+    except RecordingError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"status": "recording"}
+
+
+@app.post("/recording/page/chunk")
+async def add_page_recording_chunk(request: Request):
+    max_chunk_bytes = 2 * 1024 * 1024
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > max_chunk_bytes:
+                raise HTTPException(status_code=413, detail="Recording chunk is too large")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length")
+
+    data = bytearray()
+    async for part in request.stream():
+        if len(data) + len(part) > max_chunk_bytes:
+            raise HTTPException(status_code=413, detail="Recording chunk is too large")
+        data.extend(part)
+    try:
+        await asyncio.to_thread(PAGE_RECORDING.append, bytes(data))
+    except RecordingError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"status": "ok"}
+
+
 @app.get("/capabilities")
 async def get_capabilities():
     return {
@@ -624,17 +700,22 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                 continue
 
             msg_type = data.get("type")
+            if msg_type in ("takeoff", "land", "estop", "emergency_stop", "set_speed_index", "speed_index", "calibrate"):
+                logger.info("[WebSocket] Received command: %s", msg_type)
             if msg_type == "axes":
                 mode = data.get("mode", "abs")
+                throttle = float(data.get("throttle", 0))
+                yaw      = float(data.get("yaw", 0))
+                pitch    = float(data.get("pitch", 0))
+                roll     = float(data.get("roll", 0))
 
-                # If any plugin is running, completely ignore frontend control commands
-                # Frontend should already be suppressing these, but this is a safety check
+                # A running plugin flies until the user touches the controls. Then
+                # the user flies, and the plugin resumes shortly after they let go.
                 plugin_running = bool(plugin_manager and plugin_manager.running())
+                if plugin_running and any((throttle, yaw, pitch, roll)):
+                    flight_controller.note_manual_input()
 
-                if plugin_running:
-                    # Plugin has full control - don't process frontend axes at all
-                    pass
-                else:
+                if not plugin_running or flight_controller.manual_override_active():
                     # Switch strategy based on mode (treat "mouse" as absolute)
                     try:
                         if mode in ("abs", "mouse"):
@@ -646,13 +727,10 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                     except Exception:
                         pass
 
-                    throttle = float(data.get("throttle", 0))
-                    yaw      = float(data.get("yaw", 0))
-                    pitch    = float(data.get("pitch", 0))
-                    roll     = float(data.get("roll", 0))
-                    
                     flight_controller.set_axes_from("frontend", throttle, yaw, pitch, roll)
-                    _apply_camera_tilt_command(flight_controller.model, data)
+
+                # Camera tilt doesn't affect flight, so it works alongside a plugin.
+                _apply_camera_tilt_command(flight_controller.model, data)
             elif msg_type == "set_profile":
                 try:
                     flight_controller.model.set_profile(data.get("name", "normal"))
@@ -665,6 +743,10 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                     pass
             elif msg_type == "takeoff":
                 try:
+                    # Lift off with centered sticks. A running plugin takes over after.
+                    if plugin_manager and plugin_manager.running():
+                        flight_controller.note_manual_input(TAKEOFF_CLEAR_S)
+                        flight_controller.set_axes_from("frontend", 0, 0, 0, 0)
                     flight_controller.model.takeoff()
                 except Exception:
                     pass
@@ -686,10 +768,36 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                     _apply_camera_tilt_command(flight_controller.model, data)
                 except Exception:
                     pass
+            elif msg_type == "calibrate":
+                try:
+                    flight_controller.model.calibrate_gyro()
+                except Exception:
+                    pass
     except WebSocketDisconnect:
         logger.info("[WebSocket] Client disconnected")
     except Exception as e:
         logger.exception("[WebSocket] Error: %s", e)
+    finally:
+        # A key held when the page goes away must not keep the drone moving.
+        if flight_controller:
+            flight_controller.set_axes_from("frontend", 0, 0, 0, 0)
+
+
+@app.websocket("/ws/status")
+async def ws_status(websocket: WebSocket) -> None:
+    """Push what the web page shows: is video live, and what are plugins doing."""
+    await websocket.accept()
+    try:
+        while True:
+            await websocket.send_json({
+                "video_live": time.monotonic() - LAST_FRAME_TIME["value"] < VIDEO_LIVE_WINDOW_S,
+                "plugins": plugin_manager.running() if plugin_manager else [],
+                "plugin_status": plugin_manager.statuses() if plugin_manager else {},
+                "recording": {"active": RECORDER.active, "seconds": round(RECORDER.seconds, 1)},
+            })
+            await asyncio.sleep(0.25)
+    except Exception:
+        pass  # Client went away.
 
 # ───────────────────────────────────────────────────────────────
 # Video streaming
@@ -717,6 +825,8 @@ def _frame_pump_worker(
             if frame:
                 first_frame_seen = True
                 last_frame_time = time.monotonic()
+                LAST_FRAME_TIME["value"] = last_frame_time
+                RECORDER.add_frame(frame.data)
                 # Send to MJPEG/overlay pipelines immediately
                 asyncio.run_coroutine_threadsafe(frame_hub.publish(frame.data), loop)
                 if plugin_q is not None:
@@ -737,6 +847,8 @@ def _frame_pump_worker(
             frame = raw_q.get(timeout=1.0)
             if frame:
                 last_frame_time = time.monotonic()
+                LAST_FRAME_TIME["value"] = last_frame_time
+                RECORDER.add_frame(frame.data)
                 timed_out = False
                 try:
                     asyncio.run_coroutine_threadsafe(frame_hub.publish(frame.data), loop)

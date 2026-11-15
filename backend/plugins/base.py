@@ -11,6 +11,9 @@ class Plugin(ABC):
       • or an np.ndarray BGR/RGB image.
     """
 
+    # Optional JSON-friendly summary the web page can show while the plugin runs.
+    status = None
+
     def __init__(self,
                  name: str,
                  flight_controller: FlightController,

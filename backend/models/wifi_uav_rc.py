@@ -31,6 +31,9 @@ class WifiUavRcModel(BaseRCModel):
         "aggressive": ControlProfile("aggressive", 4.0, 3.0, 1.2, 0.10),
     }
 
+    # WiFi-UAV app speed tiers: 0=30%, 1=60%, 2=100%, 3=25%
+    SPEED_SCALES = (0.30, 0.60, 1.00, 0.25)
+
     def __init__(self, profile: str | ControlProfile = "normal") -> None:
         super().__init__(stick_range=self.STICK_RANGE, profile=profile)
 
@@ -57,6 +60,15 @@ class WifiUavRcModel(BaseRCModel):
     # ------------------------------------------------------------------ #
     def update(self, dt, axes):          # type: ignore[override]
         self.strategy.update(self, dt, axes)
+
+    @property
+    def speed_scale(self) -> float:
+        """How much the current speed tier scales yaw, pitch and roll."""
+        return self.SPEED_SCALES[self.speed_index]
+
+    def calibrate_gyro(self):
+        """Request the app's gyro check. Only for use on flat ground."""
+        self.calibration_flag = True
 
     def takeoff(self):
         self.takeoff_flag = True

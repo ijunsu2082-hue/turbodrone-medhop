@@ -1,9 +1,13 @@
+import logging
 import socket
+import time
 from typing import Final, List, Optional
 
 from protocols.base_protocol_adapter import BaseProtocolAdapter
 from models.wifi_uav_rc import WifiUavRcModel
 from utils.wifi_uav_variants import get_wifi_uav_capabilities
+
+logger = logging.getLogger(__name__)
 
 
 class WifiUavRcProtocolAdapter(BaseProtocolAdapter):
@@ -47,7 +51,23 @@ class WifiUavRcProtocolAdapter(BaseProtocolAdapter):
     FLAG_CALIBRATION = 0x04
     FLAG_FLIP = 0x08
 
-    _SPEED_SCALES: Final[tuple[float, ...]] = (0.30, 0.60, 1.00, 0.25)
+    _SPEED_SCALES: Final[tuple[float, ...]] = WifiUavRcModel.SPEED_SCALES
+
+    # Takeoff/land and e-stop stay set across packets for this long: long enough
+    # that the drone can't miss it, short enough that a shared takeoff/land bit
+    # is seen as one press.
+    COMMAND_HOLD_S: Final[float] = 0.15
+    _one_key_until: float = 0.0
+    _stop_until: float = 0.0
+    _calibrate_until: float = 0.0
+    # A quick click on tilt still has to move the servo far enough to see.
+    TILT_MIN_PULSE_S: Final[float] = 0.6
+    _tilt_state: int = 0
+    _tilt_until: float = 0.0
+    # 20-byte extended command from the newest packet, for the video requests.
+    latest_command: Optional[bytes] = None
+    _logged_control_state: Optional[tuple] = None
+    _control_log_ts: float = 0.0
 
     # ------------------------------------------------------------------ #
     def __init__(self,
@@ -104,7 +124,22 @@ class WifiUavRcProtocolAdapter(BaseProtocolAdapter):
 
         # ----- command / headless --------------------------------------
         command = 0x00
-        if drone_model.takeoff_flag or drone_model.land_flag:
+        now = time.monotonic()
+        if drone_model.stop_flag:
+            # E-stop wins over any takeoff/land still being held.
+            self._stop_until = now + self.COMMAND_HOLD_S
+            self._one_key_until = 0.0
+            logger.info("[wifi-uav] STOP: holding bit 0x%02x for %.0f ms", self.FLAG_STOP, self.COMMAND_HOLD_S * 1000)
+        elif now >= self._stop_until and (drone_model.takeoff_flag or drone_model.land_flag) and now >= self._one_key_until:
+            # Repeat clicks during a hold don't extend it, so they stay one press.
+            self._one_key_until = now + self.COMMAND_HOLD_S
+            logger.info(
+                "[wifi-uav] %s: holding bit 0x%02x for %.0f ms",
+                "LAND" if drone_model.land_flag else "TAKEOFF",
+                self.FLAG_TAKEOFF_OR_LAND,
+                self.COMMAND_HOLD_S * 1000,
+            )
+        if now < self._one_key_until:
             command |= self.FLAG_TAKEOFF_OR_LAND
         if drone_model.land_flag:
             self._last_command_intent = "LAND"
@@ -116,13 +151,22 @@ class WifiUavRcProtocolAdapter(BaseProtocolAdapter):
             self._last_command_intent = "CALIBRATE"
         else:
             self._last_command_intent = None
-        if drone_model.stop_flag:
+        if now < self._stop_until:
             command |= self.FLAG_STOP
         if drone_model.calibration_flag:
+            self._calibrate_until = now + self.COMMAND_HOLD_S
+            logger.info("[wifi-uav] CALIBRATE: holding bit 0x%02x for %.0f ms", self.FLAG_CALIBRATION, self.COMMAND_HOLD_S * 1000)
+        if now < self._calibrate_until:
             command |= self.FLAG_CALIBRATION
         if getattr(drone_model, "flip_flag", False):
             command |= self.FLAG_FLIP
-        camera_tilt_state = max(0, min(2, int(getattr(drone_model, "camera_tilt_state", 0))))
+        requested_tilt = max(0, min(2, int(getattr(drone_model, "camera_tilt_state", 0))))
+        if requested_tilt:
+            self._tilt_state = requested_tilt
+            self._tilt_until = now + self.TILT_MIN_PULSE_S
+        elif now >= self._tilt_until:
+            self._tilt_state = 0
+        camera_tilt_state = self._tilt_state
         command |= (camera_tilt_state & 0x03) << 6
 
         headless = 0x03 if drone_model.headless_flag else 0x02
@@ -150,6 +194,7 @@ class WifiUavRcProtocolAdapter(BaseProtocolAdapter):
             command & 0xFF,
             headless & 0xFF,
         ]
+        self._log_control_change(axis_controls, axis_labels, camera_tilt_state, speed_index, now)
 
         # Stash for debug printing at send time.
         try:
@@ -174,6 +219,7 @@ class WifiUavRcProtocolAdapter(BaseProtocolAdapter):
         pkt += self._CHECKSUM_SUFFIX
         pkt += c2 + self._COUNTER2_SUFFIX
         pkt += c3 + self._COUNTER3_SUFFIX
+        self.latest_command = bytes(pkt[18:38])
 
         # one-shot flags → clear
         drone_model.takeoff_flag = False
@@ -195,10 +241,12 @@ class WifiUavRcProtocolAdapter(BaseProtocolAdapter):
         try:
             for port in self._target_ports:
                 self.sock.sendto(packet, (self.drone_ip, port))
-        except OSError:
+        except OSError as exc:
             # Socket was closed during video-reconnect window.
             # Wait for VideoReceiverService to call set_socket(…) with the
             # new descriptor.  Until then we just skip transmitting.
+            if getattr(self, "_last_command", 0) & (self.FLAG_TAKEOFF_OR_LAND | self.FLAG_STOP):
+                logger.warning("[wifi-uav] Command packet was not sent: %s", exc)
             return
 
         if self.debug_packets:
@@ -235,6 +283,16 @@ class WifiUavRcProtocolAdapter(BaseProtocolAdapter):
         state = "ON" if self.debug_packets else "OFF"
         print(f"[wifi-uav] debug {state}")
         return self.debug_packets
+
+    def _log_control_change(self, axes, labels, tilt: int, speed_index: int, now: float) -> None:
+        """Record what is going to the drone, on change and at most 4 times a second."""
+        state = (tuple(axes), tilt, speed_index)
+        if state == self._logged_control_state or now - self._control_log_ts < 0.25:
+            return
+        self._logged_control_state = state
+        self._control_log_ts = now
+        sticks = " ".join(f"{label}:{value}" for label, value in zip(labels, axes))
+        logger.info("[wifi-uav] Sending sticks %s tilt=%d speed=%d", sticks, tilt, speed_index)
 
     def _resolve_target_ports(self, control_port: int) -> tuple[int, ...]:
         if self.capabilities.transport == "uav_dual_port":
