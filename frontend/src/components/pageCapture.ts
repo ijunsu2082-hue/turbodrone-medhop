@@ -45,12 +45,23 @@ export async function startPageCapture(stream: MediaStream): Promise<PageCapture
 
   // One upload at a time, because the pieces must arrive in order.
   let uploads: Promise<void> = Promise.resolve();
+  let uploadError: Error | null = null;
   const recorder = new MediaRecorder(stream, { mimeType: format[0], videoBitsPerSecond: 8_000_000 });
   recorder.ondataavailable = ({ data }) => {
     if (data.size === 0) return;
     uploads = uploads.then(async () => {
-      const response = await fetch(`${API_BASE_URL}/recording/page/chunk`, { method: "POST", body: data });
-      if (!response.ok) throw new Error("A page recording chunk could not be saved");
+      const chunkSize = 2 * 1024 * 1024;
+      for (let offset = 0; offset < data.size && !uploadError; offset += chunkSize) {
+        try {
+          const response = await fetch(`${API_BASE_URL}/recording/page/chunk`, {
+            method: "POST",
+            body: data.slice(offset, offset + chunkSize),
+          });
+          if (!response.ok) throw new Error("A page recording chunk could not be saved");
+        } catch (error) {
+          uploadError = error instanceof Error ? error : new Error("A page recording chunk could not be saved");
+        }
+      }
     });
   };
   const stopped = new Promise<void>((resolve) => {
@@ -64,6 +75,7 @@ export async function startPageCapture(stream: MediaStream): Promise<PageCapture
       await stopped;
       stopStream();
       await uploads;
+      if (uploadError) throw uploadError;
     },
   };
 }

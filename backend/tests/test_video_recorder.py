@@ -107,7 +107,8 @@ class PageRecordingTests(unittest.TestCase):
         self.page.append(b"one")
         self.page.append(b"two")
         path = self.page.stop()
-        self.assertTrue(path.endswith("-page.mp4"))
+        self.assertTrue(os.path.basename(path).startswith("turbodrone-page-"))
+        self.assertTrue(path.endswith(".mp4"))
         with open(path, "rb") as saved:
             self.assertEqual(saved.read(), b"onetwo")
 
